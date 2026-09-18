@@ -1,14 +1,33 @@
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
+import * as PlatformError from "effect/PlatformError";
 import * as Schema from "effect/Schema";
 
 export class V2DesktopProfileInitializationError extends Schema.TaggedError<V2DesktopProfileInitializationError>()(
   "V2DesktopProfileInitializationError",
-  { destinationPath: Schema.String, cause: Schema.Defect() },
+  {
+    operation: Schema.Literals(["inspect", "read", "create-directory", "write"]),
+    resourcePath: Schema.String,
+    category: Schema.String,
+    cause: Schema.Defect(),
+  },
 ) {
   override get message() {
-    return `Could not preserve Windows credential encryption for the V2 desktop profile at ${this.destinationPath}.`;
+    return `Could not preserve Windows credential encryption during ${this.operation} at ${this.resourcePath} (${this.category}).`;
+  }
+
+  static fromFileSystem(
+    cause: PlatformError.PlatformError,
+    operation: V2DesktopProfileInitializationError["operation"],
+    resourcePath: string,
+  ) {
+    return new V2DesktopProfileInitializationError({
+      operation,
+      resourcePath,
+      category: cause.reason._tag,
+      cause,
+    });
   }
 }
 
@@ -20,25 +39,46 @@ export const initializeV2DesktopProfile = Effect.fn("initializeV2DesktopProfile"
 ) {
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
-  yield* Effect.gen(function* () {
-    const destinationState = path.join(destinationPath, "Local State");
-    if (yield* fs.exists(destinationState)) return;
-    const legacyPath = path.join(appDataDirectory, legacyUserDataDirName);
-    const sourcePath = (yield* fs.exists(legacyPath))
-      ? legacyPath
-      : path.join(appDataDirectory, "t3code");
-    const sourceState = path.join(sourcePath, "Local State");
-    if (!(yield* fs.exists(sourceState))) return;
-    const state = yield* fs.readFileString(sourceState);
-    yield* fs.makeDirectory(destinationPath, { recursive: true });
-    yield* fs
-      .writeFileString(destinationState, state, { flag: "wx" })
+  const inspect = (resourcePath: string) =>
+    fs
+      .exists(resourcePath)
       .pipe(
-        Effect.catch((error) =>
-          error.reason._tag === "AlreadyExists" ? Effect.void : Effect.fail(error),
+        Effect.mapError((cause) =>
+          V2DesktopProfileInitializationError.fromFileSystem(cause, "inspect", resourcePath),
         ),
       );
-  }).pipe(
-    Effect.mapError((cause) => new V2DesktopProfileInitializationError({ destinationPath, cause })),
+  const destinationState = path.join(destinationPath, "Local State");
+  if (yield* inspect(destinationState)) return;
+  const legacyPath = path.join(appDataDirectory, legacyUserDataDirName);
+  const sourcePath = (yield* inspect(legacyPath))
+    ? legacyPath
+    : path.join(appDataDirectory, "t3code");
+  const sourceState = path.join(sourcePath, "Local State");
+  if (!(yield* inspect(sourceState))) return;
+  const state = yield* fs
+    .readFileString(sourceState)
+    .pipe(
+      Effect.mapError((cause) =>
+        V2DesktopProfileInitializationError.fromFileSystem(cause, "read", sourceState),
+      ),
+    );
+  yield* fs
+    .makeDirectory(destinationPath, { recursive: true })
+    .pipe(
+      Effect.mapError((cause) =>
+        V2DesktopProfileInitializationError.fromFileSystem(
+          cause,
+          "create-directory",
+          destinationPath,
+        ),
+      ),
+    );
+  yield* fs.writeFileString(destinationState, state, { flag: "wx" }).pipe(
+    Effect.catch((error) =>
+      error.reason._tag === "AlreadyExists" ? Effect.void : Effect.fail(error),
+    ),
+    Effect.mapError((cause) =>
+      V2DesktopProfileInitializationError.fromFileSystem(cause, "write", destinationState),
+    ),
   );
 });
