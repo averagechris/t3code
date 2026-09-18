@@ -3,12 +3,17 @@ import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Path from "effect/Path";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 
 import * as ElectronApp from "../electron/ElectronApp.ts";
 import * as DesktopAssets from "./DesktopAssets.ts";
 import * as DesktopEnvironment from "./DesktopEnvironment.ts";
+import {
+  initializeV2DesktopProfile,
+  V2DesktopProfileInitializationError,
+} from "./initializeV2DesktopProfile.ts";
 
 const COMMIT_HASH_PATTERN = /^[0-9a-f]{7,40}$/i;
 const COMMIT_HASH_DISPLAY_LENGTH = 12;
@@ -33,7 +38,10 @@ export class DesktopUserDataPathResolutionError extends Schema.TaggedError<Deskt
 export class DesktopAppIdentity extends Context.Service<
   DesktopAppIdentity,
   {
-    readonly resolveUserDataPath: Effect.Effect<string, DesktopUserDataPathResolutionError>;
+    readonly resolveUserDataPath: Effect.Effect<
+      string,
+      DesktopUserDataPathResolutionError | V2DesktopProfileInitializationError
+    >;
     readonly configure: Effect.Effect<void>;
   }
 >()("@t3tools/desktop/app/DesktopAppIdentity") {}
@@ -47,6 +55,22 @@ const normalizeCommitHash = (value: string): Option.Option<string> => {
 
 export const resolveUserDataPath = Effect.gen(function* () {
   const environment = yield* DesktopEnvironment.DesktopEnvironment;
+  // Chromium's profile databases cannot be shared by running V1 and V2 apps,
+  // even though the server's SQLite snapshot supports concurrent readers.
+  if (!environment.isDevelopment) {
+    const destinationPath = environment.path.join(
+      environment.appDataDirectory,
+      environment.userDataDirName,
+    );
+    if (environment.platform === "win32") {
+      yield* initializeV2DesktopProfile(
+        environment.appDataDirectory,
+        environment.legacyUserDataDirName,
+        destinationPath,
+      ).pipe(Effect.provideService(Path.Path, environment.path));
+    }
+    return destinationPath;
+  }
   const fileSystem = yield* FileSystem.FileSystem;
   const legacyPath = environment.path.join(
     environment.appDataDirectory,

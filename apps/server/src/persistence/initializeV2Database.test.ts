@@ -169,6 +169,76 @@ it.effect("uses statev2.sqlite for default and explicit development paths", () =
   }).pipe(Effect.provide(NodeServices.layer)),
 );
 
+it.effect("starts V2 while V1 has a WAL writer and multiple active readers", () => {
+  const directory = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-v2-concurrent-"));
+  const sourcePath = NodePath.join(directory, "state.sqlite");
+  const destinationPath = NodePath.join(directory, "statev2.sqlite");
+  const openDatabase = (readOnly: boolean) =>
+    Effect.acquireRelease(
+      Effect.sync(() => new NodeSqlite.DatabaseSync(sourcePath, { readOnly })),
+      (database) => Effect.sync(() => database.close()),
+    );
+
+  return Effect.gen(function* () {
+    const v1 = yield* openDatabase(false);
+    v1.exec(
+      "PRAGMA journal_mode=WAL; CREATE TABLE v1_work(text TEXT); INSERT INTO v1_work VALUES ('committed');",
+    );
+    const readers = [yield* openDatabase(true), yield* openDatabase(true)];
+    for (const reader of readers) {
+      reader.exec("BEGIN");
+      assert.equal(reader.prepare("SELECT text FROM v1_work").get()?.text, "committed");
+    }
+    v1.exec("BEGIN IMMEDIATE; INSERT INTO v1_work VALUES ('continued in V1');");
+
+    const config = yield* ServerConfig;
+    const database = layerConfig.pipe(
+      Layer.provide(configLayer({ ...config, dbPath: destinationPath })),
+    );
+    yield* Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      assert.deepEqual(
+        (yield* sql`SELECT text FROM v1_work`).map((row) => row.text),
+        ["committed"],
+      );
+      v1.exec("COMMIT");
+      yield* sql`CREATE TABLE v2_work(text TEXT)`;
+      yield* sql`INSERT INTO v2_work VALUES ('continued in V2')`;
+      assert.equal((yield* sql`SELECT text FROM v2_work`)[0]?.text, "continued in V2");
+      assert.deepEqual(
+        (yield* sql`SELECT text FROM v1_work`).map((row) => row.text),
+        ["committed"],
+      );
+      for (const reader of readers) {
+        assert.deepEqual(
+          reader
+            .prepare("SELECT text FROM v1_work")
+            .all()
+            .map((row) => row.text),
+          ["committed"],
+        );
+        reader.exec("COMMIT");
+        assert.deepEqual(
+          reader
+            .prepare("SELECT text FROM v1_work")
+            .all()
+            .map((row) => row.text),
+          ["committed", "continued in V1"],
+        );
+        assert.equal(
+          reader.prepare("SELECT count(*) AS count FROM sqlite_master WHERE name = 'v2_work'").get()
+            ?.count,
+          0,
+        );
+      }
+    }).pipe(Effect.provide(database));
+  }).pipe(
+    Effect.scoped,
+    Effect.provide(layerTest(directory, directory).pipe(Layer.provideMerge(NodeServices.layer))),
+    Effect.ensuring(Effect.sync(() => NodeFS.rmSync(directory, { recursive: true, force: true }))),
+  );
+});
+
 it.effect("starts fresh without V1 and never imports over existing V2 state", () => {
   const directory = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-v2-fresh-"));
   const destinationPath = NodePath.join(directory, "userdata", "statev2.sqlite");
