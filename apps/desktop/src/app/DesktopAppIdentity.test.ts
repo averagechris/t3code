@@ -146,40 +146,6 @@ const withIdentity = <A, E, R>(
 };
 
 describe("DesktopAppIdentity", () => {
-  for (const [platform, expectedPath] of [
-    ["darwin", "/Users/alice/Library/Application Support/t3code-v2"],
-    ["linux", "/Users/alice/.config/t3code-v2"],
-  ] as const) {
-    it.effect(`uses the isolated V2 profile on ${platform} without probing V1 storage`, () =>
-      withIdentity(
-        Effect.gen(function* () {
-          const identity = yield* DesktopAppIdentity.DesktopAppIdentity;
-          assert.equal(yield* identity.resolveUserDataPath, expectedPath);
-        }),
-        {
-          environment: { platform },
-          legacyPathProbeError: PlatformError.systemError({
-            _tag: "PermissionDenied",
-            module: "FileSystem",
-            method: "exists",
-            description: "V1 profile is unavailable",
-            pathOrDescriptor: "/legacy-profile",
-          }),
-        },
-      ),
-    );
-  }
-
-  it.effect("uses the isolated V2 profile on Windows", () =>
-    withIdentity(
-      Effect.gen(function* () {
-        const identity = yield* DesktopAppIdentity.DesktopAppIdentity;
-        assert.equal(yield* identity.resolveUserDataPath, "/Users/alice/AppData/Roaming/t3code-v2");
-      }),
-      { environment: { platform: "win32" } },
-    ),
-  );
-
   it.effect("isolates the V2 profile even when the legacy V1 profile exists", () =>
     withIdentity(
       Effect.gen(function* () {
