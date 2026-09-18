@@ -73,6 +73,7 @@ export const deliverContextHandoffs = Effect.fn("orchestrationV2.deliverContextH
       if (input.deferInline) return { context: "", delivered: Effect.void };
       return yield* new ContextHandoffBudgetError();
     }
+    const omittedItemIds = new Set(selected.omittedItemIds);
     const persist = (status: "pending" | "injected" | "inline") =>
       Effect.forEach(
         pending,
@@ -85,6 +86,12 @@ export const deliverContextHandoffs = Effect.fn("orchestrationV2.deliverContextH
                   delivery: {
                     nativeThreadId,
                     status,
+                    omittedItemIds: [
+                      ...(handoff.history?.omittedItemIds ?? []),
+                      ...(handoff.history?.messages ?? [])
+                        .filter((message) => omittedItemIds.has(message.itemId))
+                        .map((message) => message.itemId),
+                    ],
                     itemIds: selected.messages
                       .filter((message) =>
                         handoff.history?.messages.some(

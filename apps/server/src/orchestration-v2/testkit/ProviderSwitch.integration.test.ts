@@ -3,6 +3,7 @@ import { historyResponseItems } from "../ContextHandoffBudget.ts";
 import { assert, describe, it } from "@effect/vitest";
 import {
   CommandId,
+  type ChatAttachment,
   EventId,
   MessageId,
   type ModelSelection,
@@ -90,6 +91,7 @@ interface CapturedTurn {
   readonly threadId: ThreadId;
   readonly providerThreadId: ProviderThreadId;
   readonly text: string;
+  readonly attachments: ReadonlyArray<ChatAttachment>;
 }
 
 function unimplemented(driver: ProviderDriverKind, detail: string) {
@@ -216,6 +218,7 @@ function makeTestAdapter(input: {
                   threadId: turnInput.threadId,
                   providerThreadId: turnInput.providerThread.id,
                   text: turnInput.message.text,
+                  attachments: turnInput.message.attachments,
                 },
               ]);
               if (
@@ -350,6 +353,8 @@ describe("orchestration v2 provider switching", () => {
     "compact-fallback",
     "compact-legacy",
     "large-current-input",
+    "screenshot-native",
+    "screenshot-fallback",
     "delivery-write-failure",
   ] as const) {
     it.live(`preserves handoffs through ${scenario}`, () =>
@@ -374,7 +379,9 @@ describe("orchestration v2 provider switching", () => {
               modelSelection: CLAUDE_MODEL_SELECTION,
               responseByRunOrdinal: {},
               capturedTurns,
-              ...(scenario === "compact-native" || scenario === "large-current-input"
+              ...(scenario === "compact-native" ||
+              scenario === "large-current-input" ||
+              scenario === "screenshot-native"
                 ? { injectedHistory }
                 : {}),
             }),
@@ -383,6 +390,13 @@ describe("orchestration v2 provider switching", () => {
             const orchestrator = yield* OrchestratorV2;
             const worker = yield* OrchestrationEffectWorkerV2;
             const eventSink = yield* EventSinkV2;
+            const screenshot: ChatAttachment = {
+              type: "image",
+              id: "screenshot",
+              name: "screenshot.png",
+              mimeType: "image/png",
+              sizeBytes: 100_000,
+            };
             const dispatch = (ordinal: number, text: string, selection: ModelSelection) =>
               orchestrator.dispatch({
                 type: "message.dispatch",
@@ -392,7 +406,7 @@ describe("orchestration v2 provider switching", () => {
                 createdBy: "user",
                 creationSource: "web",
                 text,
-                attachments: [],
+                attachments: scenario.startsWith("screenshot") && ordinal === 2 ? [screenshot] : [],
                 modelSelection: selection,
                 dispatchMode: { type: "start_immediately" },
               });
@@ -461,6 +475,9 @@ describe("orchestration v2 provider switching", () => {
             const projection = yield* orchestrator.getThreadProjection(threadId);
             assert.equal(projection.runs.at(-1)?.status, "completed");
             const handoff = projection.contextHandoffs.at(-1)!;
+            if (scenario.startsWith("screenshot")) {
+              assert.deepEqual((yield* Ref.get(capturedTurns)).at(-1)!.attachments, [screenshot]);
+            }
             if (scenario === "compact-fallback" || scenario === "compact-legacy") {
               if (scenario === "compact-legacy") {
                 const { history: _history, ...legacyHandoff } = handoff;
@@ -489,8 +506,14 @@ describe("orchestration v2 provider switching", () => {
                   ?.status,
                 "inline",
               );
-            } else if (scenario === "delivery-write-failure") {
-              assert.equal(handoff.delivery?.status, "pending");
+            } else if (
+              scenario === "delivery-write-failure" ||
+              scenario === "screenshot-fallback"
+            ) {
+              assert.equal(
+                handoff.delivery?.status,
+                scenario === "screenshot-fallback" ? "inline" : "pending",
+              );
               assert.include(
                 (yield* Ref.get(capturedTurns)).at(-1)!.text,
                 "Original request with constraints",
@@ -578,10 +601,18 @@ describe("orchestration v2 provider switching", () => {
                     ({ event }) =>
                       event.type === "run.updated" &&
                       event.payload.ordinal === ordinal &&
-                      event.payload.status === status,
+                      (event.payload.status === "completed" || event.payload.status === "failed"),
                   ),
                   Stream.runHead,
                   Effect.andThen(worker.drain()),
+                  Effect.andThen(
+                    Effect.gen(function* () {
+                      assert.equal(
+                        (yield* orchestrator.getThreadProjection(threadId)).runs.at(-1)?.status,
+                        status,
+                      );
+                    }),
+                  ),
                 );
               yield* orchestrator.dispatch({
                 type: "thread.create",
@@ -623,8 +654,15 @@ describe("orchestration v2 provider switching", () => {
                 const delta = yield* encodeJson(
                   (yield* Ref.get(injectedHistory)).slice(historyBeforeRetry),
                 );
-                if (failure === "large-missed-request") assert.include(delta, "omitted 1 items");
-                else assert.include(delta, "First target request");
+                if (failure === "large-missed-request") {
+                  assert.include(delta, "omitted 1 items");
+                  const missedRequest = retried.turnItems.find(
+                    (item) => item.type === "user_message" && item.text === "x".repeat(7_000),
+                  )!;
+                  const delivery = retried.contextHandoffs.at(-1)!.delivery!;
+                  assert.include(delivery.omittedItemIds ?? [], missedRequest.id);
+                  assert.notInclude(delivery.itemIds, missedRequest.id);
+                } else assert.include(delta, "First target request");
                 assert.notInclude(delta, "Original request with constraints");
                 assert.notInclude(delta, "Original partial work");
                 assert.equal(yield* Ref.get(generation), 1);
@@ -641,6 +679,16 @@ describe("orchestration v2 provider switching", () => {
                 assert.include(newHistory, "Original partial work");
                 assert.notInclude(newHistory, "Retry target request");
               }
+              const beforeFollowup = yield* Ref.get(injectedHistory);
+              const followup = "z".repeat(6_000);
+              yield* dispatch(4, followup, CLAUDE_MODEL_SELECTION);
+              yield* wait(4, "completed");
+              assert.equal((yield* Ref.get(capturedTurns)).at(-1)!.text, followup);
+              assert.deepEqual(yield* Ref.get(injectedHistory), beforeFollowup);
+              assert.equal(
+                (yield* orchestrator.getThreadProjection(threadId)).contextHandoffs.length,
+                retried.contextHandoffs.length,
+              );
             }).pipe(
               Effect.provide(
                 makeOrchestratorV2ReplayLayerWithRegistry(

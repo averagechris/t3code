@@ -227,26 +227,89 @@ describe("handoff budget", () => {
       }),
       0,
     );
-    assert.equal(
-      handoffBudget({
-        ...base,
-        attachments: [
-          {
-            type: "image",
-            id: "attachment",
-            name: "image.png",
-            mimeType: "image/png",
-            sizeBytes: 40_000,
+    for (const sizeBytes of [100_000, 10 * 1024 * 1024]) {
+      const attachments = [
+        {
+          type: "image",
+          id: "attachment",
+          name: "image.png",
+          mimeType: "image/png",
+          sizeBytes,
+        },
+      ];
+      const withImage = handoffBudget({ ...base, attachments });
+      assert.isAbove(withImage, 4_000);
+      assert.isBelow(withImage, handoffBudget(base));
+      assert.equal(handoffBudget({ ...base, attachments: [...attachments, ...attachments] }), 0);
+      assert.equal(
+        handoffBudget({
+          ...base,
+          tokenCap: 64_000,
+          // The history byte cap is independent of both current text and image payloads.
+          userText: "x".repeat(70_000),
+          attachments,
+          providerThread: {
+            ...providerThread,
+            contextUsage: { usedTokens: 0, maxTokens: 1_000_000 },
           },
-        ],
-      }),
-      0,
-    );
+        }),
+        64_000,
+      );
+    }
     assert.equal(handoffBudget({ ...base, tokenCap: 2_000 }), 2_000);
   });
 });
 
 describe("handoff delivery", () => {
+  for (const native of [true, false]) {
+    it.effect(
+      `records omitted recovery coverage separately from ${native ? "injected" : "inline"} text`,
+      () =>
+        Effect.gen(function* () {
+          const omittedBeforeDelivery = TurnItemId.make("item:omitted-during-preparation");
+          const oversized = message("item:oversized", "user", "x".repeat(20_000));
+          let durable: OrchestrationV2ContextHandoff = {
+            ...handoff,
+            history: {
+              ...handoff.history!,
+              messages: [...messages, oversized],
+              omittedItems: 1,
+              omittedItemIds: [omittedBeforeDelivery],
+            },
+          };
+          const result = yield* deliverContextHandoffs({
+            handoffs: [durable],
+            providerThread,
+            budget: 16_000,
+            alreadyDeliveredItemIds: new Set(),
+            inject: (value) => {
+              assert.include(value.context, "omitted 2 items");
+              assert.notInclude(
+                value.messages.map((item) => item.itemId),
+                oversized.itemId,
+              );
+              return Effect.succeed(native);
+            },
+            persist: (value) =>
+              Effect.sync(() => {
+                durable = value;
+              }),
+          });
+          assert.equal(durable.delivery?.status, native ? "injected" : "pending");
+          yield* result.delivered;
+          assert.equal(durable.delivery?.status, native ? "injected" : "inline");
+          assert.deepEqual(
+            durable.delivery?.itemIds,
+            messages.map((item) => item.itemId),
+          );
+          assert.deepEqual(durable.delivery?.omittedItemIds, [
+            omittedBeforeDelivery,
+            oversized.itemId,
+          ]);
+          assert.deepEqual(decodeHandoff(durable).delivery, durable.delivery);
+        }),
+    );
+  }
   it.effect("persists successful injection before turn start and skips it on retry", () =>
     Effect.gen(function* () {
       let durable = handoff;

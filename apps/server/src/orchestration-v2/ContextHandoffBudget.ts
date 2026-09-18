@@ -29,8 +29,14 @@ export function handoffBudget(input: {
   const usage = input.providerThread.contextUsage;
   const window = Math.min(usage?.maxTokens ?? 32_000, usage?.autoCompactThreshold ?? Infinity);
   const native = usage?.usedTokens ?? input.nativeContextBytes;
+  // Encoded image bytes are not model tokens. Without dimensions/detail metadata,
+  // reserve 8k tokens per image, above typical resized Codex/Claude image costs.
+  // This is a fallback estimate, not a bound for original-resolution/custom models.
+  // https://developers.openai.com/api/docs/guides/image-cost-calculator
+  // https://platform.claude.com/docs/en/build-with-claude/vision
+  // Other attachments are path references; reserve space for their descriptors.
   const attachmentAllowance = input.attachments.reduce(
-    (sum, attachment) => sum + Math.max(4_096, attachment.sizeBytes),
+    (sum, attachment) => sum + (attachment.type === "image" ? 8_192 : 4_096),
     0,
   );
   const current = Buffer.byteLength(JSON.stringify(input.userText)) + attachmentAllowance;
@@ -38,7 +44,9 @@ export function handoffBudget(input: {
     0,
     Math.min(
       input.tokenCap,
-      HANDOFF_BYTE_CAP - current,
+      // Cap only imported history. Attachment transport limits belong to adapters;
+      // they may send binary/base64 data separately from the history request.
+      HANDOFF_BYTE_CAP,
       window - native - current - Math.max(16_000, Math.ceil(window / 4)),
     ),
   );
@@ -168,6 +176,9 @@ export function selectHistory(input: {
   for (let index = messages.length - 1; index >= 0; index--) tryAdd(index);
   return {
     messages: messages.filter((_, index) => selected.has(index)),
+    omittedItemIds: messages
+      .filter((_, index) => !selected.has(index))
+      .map((message) => message.itemId),
     context: contextFor(selected.size),
     omittedItems: (input.omittedItems ?? 0) + messages.length - selected.size,
   };

@@ -685,15 +685,19 @@ export const layer: Layer.Layer<
       const sameNativeThread =
         runningProviderThread.nativeThreadRef?.nativeId ===
         providerThread.nativeThreadRef?.nativeId;
-      const deliveredItemIds = new Set(
-        projection.contextHandoffs.flatMap((handoff) =>
+      const settledHandoffs = projection.contextHandoffs.filter(
+        (handoff) =>
           handoff.toProviderThreadId === providerThread.id &&
           handoff.delivery?.nativeThreadId === runningProviderThread.nativeThreadRef?.nativeId &&
-          handoff.delivery?.status !== "pending"
-            ? (handoff.delivery?.itemIds ?? [])
-            : [],
-        ),
+          handoff.delivery?.status !== "pending",
       );
+      const deliveredItemIds = new Set(
+        settledHandoffs.flatMap((handoff) => handoff.delivery?.itemIds ?? []),
+      );
+      const coveredItemIds = new Set([
+        ...deliveredItemIds,
+        ...settledHandoffs.flatMap((handoff) => handoff.delivery?.omittedItemIds ?? []),
+      ]);
       // Canonical text is a fallback estimate when a resumed provider supplies no
       // context telemetry. Native compaction/hidden tool state may differ.
       const nativeContextBytes = () =>
@@ -741,7 +745,7 @@ export const layer: Layer.Layer<
               (item) =>
                 item.runId !== null &&
                 missedRunIds.has(item.runId) &&
-                !deliveredItemIds.has(item.id) &&
+                !coveredItemIds.has(item.id) &&
                 historicalMessage(item) !== null,
             );
       const startWithHandoffs = (
