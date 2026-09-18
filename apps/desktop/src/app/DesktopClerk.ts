@@ -4,6 +4,7 @@ import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 
@@ -11,7 +12,7 @@ import { clerkFrontendApiHostnameFromPublishableKey } from "@t3tools/shared/rela
 import * as ElectronApp from "../electron/ElectronApp.ts";
 import * as ElectronProtocol from "../electron/ElectronProtocol.ts";
 import * as ElectronWindow from "../electron/ElectronWindow.ts";
-import * as DesktopAppIdentity from "./DesktopAppIdentity.ts";
+import * as DesktopUserData from "./DesktopUserData.ts";
 import * as DesktopEnvironment from "./DesktopEnvironment.ts";
 
 declare const __T3CODE_BUILD_CLERK_PUBLISHABLE_KEY__: string | undefined;
@@ -88,13 +89,10 @@ export const make = Effect.gen(function* () {
   const environment = yield* DesktopEnvironment.DesktopEnvironment;
   const electronApp = yield* ElectronApp.ElectronApp;
 
-  // Electron scopes the single-instance lock to the userData directory and
-  // creates that directory when the lock is acquired. The SDK bridge takes
-  // the lock at creation, so userData must already point at the real
-  // directory here — under the default productName-derived path, acquiring
-  // the lock would create "T3 Code (Alpha)" and make the legacy-install
-  // detection in resolveUserDataPath match on fresh installs.
-  const userDataPath = yield* DesktopAppIdentity.resolveUserDataPath;
+  // The SDK bridge acquires Electron's profile-scoped single-instance lock.
+  const userDataPath = yield* DesktopUserData.resolveUserDataPath(environment).pipe(
+    Effect.provideService(Path.Path, environment.path),
+  );
   yield* electronApp.setPath("userData", userDataPath);
 
   const bridge = yield* Effect.acquireRelease(

@@ -14,6 +14,7 @@ import * as DesktopAppIdentity from "./DesktopAppIdentity.ts";
 import * as DesktopAssets from "./DesktopAssets.ts";
 import * as DesktopConfig from "./DesktopConfig.ts";
 import * as DesktopEnvironment from "./DesktopEnvironment.ts";
+import * as DesktopUserData from "./DesktopUserData.ts";
 
 const defaultEnvironmentInput = {
   dirname: "/repo/apps/desktop/dist-electron",
@@ -189,12 +190,12 @@ describe("DesktopAppIdentity", () => {
         const identity = yield* DesktopAppIdentity.DesktopAppIdentity;
         const error = yield* identity.resolveUserDataPath.pipe(Effect.flip);
 
-        assert.instanceOf(error, DesktopAppIdentity.DesktopUserDataPathResolutionError);
-        assert.equal(error.legacyPath, legacyPath);
+        assert.instanceOf(error, DesktopUserData.DesktopUserDataInitializationError);
+        assert.equal(error.resourcePath, legacyPath);
         assert.strictEqual(error.cause, cause);
         assert.equal(
           error.message,
-          `Failed to inspect legacy desktop user-data path at "${legacyPath}".`,
+          `Could not initialize Electron user data during inspect at ${legacyPath} (PermissionDenied).`,
         );
       }),
       {

@@ -10,10 +10,7 @@ import * as Schema from "effect/Schema";
 import * as ElectronApp from "../electron/ElectronApp.ts";
 import * as DesktopAssets from "./DesktopAssets.ts";
 import * as DesktopEnvironment from "./DesktopEnvironment.ts";
-import {
-  initializeV2DesktopProfile,
-  V2DesktopProfileInitializationError,
-} from "./initializeV2DesktopProfile.ts";
+import * as DesktopUserData from "./DesktopUserData.ts";
 
 const COMMIT_HASH_PATTERN = /^[0-9a-f]{7,40}$/i;
 const COMMIT_HASH_DISPLAY_LENGTH = 12;
@@ -23,24 +20,12 @@ const AppPackageMetadata = Schema.Struct({
 });
 const decodeAppPackageMetadata = Schema.decodeEffect(Schema.fromJsonString(AppPackageMetadata));
 
-export class DesktopUserDataPathResolutionError extends Schema.TaggedError<DesktopUserDataPathResolutionError>()(
-  "DesktopUserDataPathResolutionError",
-  {
-    legacyPath: Schema.String,
-    cause: Schema.Defect(),
-  },
-) {
-  override get message(): string {
-    return `Failed to inspect legacy desktop user-data path at "${this.legacyPath}".`;
-  }
-}
-
 export class DesktopAppIdentity extends Context.Service<
   DesktopAppIdentity,
   {
     readonly resolveUserDataPath: Effect.Effect<
       string,
-      DesktopUserDataPathResolutionError | V2DesktopProfileInitializationError
+      DesktopUserData.DesktopUserDataInitializationError
     >;
     readonly configure: Effect.Effect<void>;
   }
@@ -52,43 +37,6 @@ const normalizeCommitHash = (value: string): Option.Option<string> => {
     ? Option.some(trimmed.slice(0, COMMIT_HASH_DISPLAY_LENGTH).toLowerCase())
     : Option.none();
 };
-
-export const resolveUserDataPath = Effect.gen(function* () {
-  const environment = yield* DesktopEnvironment.DesktopEnvironment;
-  // Chromium's profile databases cannot be shared by running V1 and V2 apps,
-  // even though the server's SQLite snapshot supports concurrent readers.
-  if (!environment.isDevelopment) {
-    const destinationPath = environment.path.join(
-      environment.appDataDirectory,
-      environment.userDataDirName,
-    );
-    if (environment.platform === "win32") {
-      yield* initializeV2DesktopProfile(
-        environment.appDataDirectory,
-        environment.legacyUserDataDirName,
-        destinationPath,
-      ).pipe(Effect.provideService(Path.Path, environment.path));
-    }
-    return destinationPath;
-  }
-  const fileSystem = yield* FileSystem.FileSystem;
-  const legacyPath = environment.path.join(
-    environment.appDataDirectory,
-    environment.legacyUserDataDirName,
-  );
-  const legacyPathExists = yield* fileSystem.exists(legacyPath).pipe(
-    Effect.mapError(
-      (cause) =>
-        new DesktopUserDataPathResolutionError({
-          legacyPath,
-          cause,
-        }),
-    ),
-  );
-  return legacyPathExists
-    ? legacyPath
-    : environment.path.join(environment.appDataDirectory, environment.userDataDirName);
-}).pipe(Effect.withSpan("desktop.appIdentity.resolveUserDataPath"));
 
 /** @public Service construction is part of the canonical Effect module API. */
 export const make = Effect.gen(function* () {
@@ -136,10 +84,9 @@ export const make = Effect.gen(function* () {
     return commitHash;
   });
 
-  const userDataPath = resolveUserDataPath.pipe(
-    Effect.provide(
-      yield* Effect.context<DesktopEnvironment.DesktopEnvironment | FileSystem.FileSystem>(),
-    ),
+  const userDataPath = DesktopUserData.resolveUserDataPath(environment).pipe(
+    Effect.provideService(FileSystem.FileSystem, fileSystem),
+    Effect.provideService(Path.Path, environment.path),
   );
 
   const configure = Effect.gen(function* () {
