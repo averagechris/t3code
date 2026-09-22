@@ -2,6 +2,7 @@ import * as NodeAssert from "node:assert/strict";
 
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { createOpencodeClient, type OpencodeClient } from "@opencode-ai/sdk/v2";
+import type { OpenCodeClient } from "@opencode/client";
 import { it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
@@ -9,6 +10,7 @@ import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
 import * as Queue from "effect/Queue";
+import * as TestClock from "effect/testing/TestClock";
 import {
   HostProcessEnvironment,
   HostProcessExecutablePath,
@@ -20,6 +22,105 @@ import { OpenCodeRuntime, OpenCodeRuntimeLive } from "./opencodeRuntime.ts";
 const testLayer = OpenCodeRuntimeLive.pipe(Layer.provideMerge(NodeServices.layer));
 
 it.layer(testLayer)("OpenCodeRuntime inventory", (it) => {
+  it.effect("loads the native OpenCode 2 catalog for the requested location", () =>
+    Effect.gen(function* () {
+      const runtime = yield* OpenCodeRuntime;
+      const locations: unknown[] = [];
+      const response = (data: unknown) => Promise.resolve({ data });
+      const client = {
+        model: { list: (input: unknown) => (locations.push(input), response([{ id: "model" }])) },
+        provider: {
+          list: (input: unknown) => (locations.push(input), response([{ id: "provider" }])),
+        },
+        agent: { list: (input: unknown) => (locations.push(input), response([{ id: "agent" }])) },
+        skill: { list: (input: unknown) => (locations.push(input), response([{ name: "skill" }])) },
+        command: {
+          list: (input: unknown) => (locations.push(input), response([{ name: "command" }])),
+        },
+      } as unknown as OpenCodeClient;
+
+      const inventory = yield* runtime.loadOpenCodeV2Inventory!({
+        client,
+        directory: "/workspace/project",
+        managed: false,
+      });
+
+      NodeAssert.deepEqual(inventory, {
+        models: [{ id: "model" }],
+        providers: [{ id: "provider" }],
+        agents: [{ id: "agent" }],
+        skills: [{ name: "skill" }],
+        commands: [{ name: "command" }],
+      });
+      NodeAssert.deepEqual(
+        locations,
+        Array.from({ length: 5 }, () => ({ location: { directory: "/workspace/project" } })),
+      );
+    }),
+  );
+
+  it.effect("waits briefly for a managed OpenCode 2 catalog to populate", () =>
+    Effect.gen(function* () {
+      const runtime = yield* OpenCodeRuntime;
+      let modelCalls = 0;
+      const response = (data: unknown) => Promise.resolve({ data });
+      const client = {
+        model: {
+          list: () => response(++modelCalls === 1 ? [] : [{ id: "ready-model" }]),
+        },
+        provider: { list: () => response([]) },
+        agent: { list: () => response([]) },
+        skill: { list: () => response([]) },
+        command: { list: () => response([]) },
+      } as unknown as OpenCodeClient;
+
+      const fiber = yield* runtime.loadOpenCodeV2Inventory!({
+        client,
+        directory: "/workspace",
+        managed: true,
+      }).pipe(Effect.forkChild);
+      yield* Effect.yieldNow;
+      yield* TestClock.adjust("150 millis");
+      const inventory = yield* Fiber.join(fiber);
+
+      NodeAssert.equal(modelCalls, 2);
+      NodeAssert.deepEqual(inventory.models, [{ id: "ready-model" }]);
+    }).pipe(Effect.provide(TestClock.layer())),
+  );
+
+  it.effect("bounds an empty managed catalog and does not retry an external one", () =>
+    Effect.gen(function* () {
+      const runtime = yield* OpenCodeRuntime;
+      let modelCalls = 0;
+      const response = (data: unknown) => Promise.resolve({ data });
+      const client = {
+        model: { list: () => (modelCalls++, response([])) },
+        provider: { list: () => response([]) },
+        agent: { list: () => response([]) },
+        skill: { list: () => response([]) },
+        command: { list: () => response([]) },
+      } as unknown as OpenCodeClient;
+
+      const managedFiber = yield* runtime.loadOpenCodeV2Inventory!({
+        client,
+        directory: "/workspace",
+        managed: true,
+      }).pipe(Effect.forkChild);
+      yield* Effect.yieldNow;
+      yield* TestClock.adjust("2250 millis");
+      const managed = yield* Fiber.join(managedFiber);
+      NodeAssert.deepEqual(managed.models, []);
+      NodeAssert.equal(modelCalls, 5);
+
+      yield* runtime.loadOpenCodeV2Inventory!({
+        client,
+        directory: "/workspace",
+        managed: false,
+      });
+      NodeAssert.equal(modelCalls, 6);
+    }).pipe(Effect.provide(TestClock.layer())),
+  );
+
   it.effect("aborts pending SDK requests when inventory loading is interrupted", () =>
     Effect.gen(function* () {
       const runtime = yield* OpenCodeRuntime;

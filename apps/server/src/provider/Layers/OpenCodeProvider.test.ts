@@ -24,7 +24,7 @@ import {
   checkOpenCodeProviderStatus,
   openCodeCommandsToServerProviderSlashCommands,
 } from "./OpenCodeProvider.ts";
-import type { OpenCodeInventory } from "../opencodeRuntime.ts";
+import type { OpenCodeInventory, OpenCodeV2Inventory } from "../opencodeRuntime.ts";
 import { readOpenCodeGoUsageLimits } from "./openCodeUsageLimits.ts";
 const decodeOpenCodeSettings = Schema.decodeSync(OpenCodeSettings);
 
@@ -161,6 +161,8 @@ const runtimeMock = {
     inventoryError: null as Error | null,
     connectionError: null as Error | null,
     inventoryCwd: null as string | null,
+    apiVersion: 1 as 1 | 2,
+    v2ManagedInputs: [] as boolean[],
     closeCalls: 0,
     sdkClientInputs: [] as Array<{
       baseUrl: string;
@@ -172,6 +174,13 @@ const runtimeMock = {
       agents: [] as unknown[],
       skills: [] as unknown[],
     } as unknown,
+    v2Inventory: {
+      models: [],
+      providers: [],
+      agents: [],
+      skills: [],
+      commands: [],
+    } as unknown,
   },
   reset() {
     this.state.runVersionError = null;
@@ -180,6 +189,8 @@ const runtimeMock = {
     this.state.inventoryError = null;
     this.state.connectionError = null;
     this.state.inventoryCwd = null;
+    this.state.apiVersion = 1;
+    this.state.v2ManagedInputs.length = 0;
     this.state.closeCalls = 0;
     this.state.sdkClientInputs.length = 0;
     this.state.inventory = {
@@ -187,6 +198,7 @@ const runtimeMock = {
       agents: [] as unknown[],
       skills: [] as unknown[],
     };
+    this.state.v2Inventory = { models: [], providers: [], agents: [], skills: [], commands: [] };
   },
 };
 
@@ -209,6 +221,7 @@ const OpenCodeRuntimeTestDouble: OpenCodeRuntimeShape = {
           ? { serverPassword: effectiveServerPassword }
           : {}),
         version: "1.14.19",
+        apiVersion: runtimeMock.state.apiVersion,
         isRunning: Effect.succeed(true),
         exitCode: Effect.never,
       };
@@ -233,6 +246,7 @@ const OpenCodeRuntimeTestDouble: OpenCodeRuntimeShape = {
         url: serverUrl ?? "http://127.0.0.1:4301",
         ...(serverPassword ? { serverPassword } : {}),
         version: "1.14.19",
+        apiVersion: runtimeMock.state.apiVersion,
         exitCode: null,
         external: Boolean(serverUrl),
       };
@@ -252,6 +266,12 @@ const OpenCodeRuntimeTestDouble: OpenCodeRuntimeShape = {
   createOpenCodeSdkClient: (input) => {
     runtimeMock.state.sdkClientInputs.push(input);
     return {} as unknown as ReturnType<OpenCodeRuntimeShape["createOpenCodeSdkClient"]>;
+  },
+  createOpenCodeV2Client: () =>
+    ({}) as unknown as ReturnType<NonNullable<OpenCodeRuntimeShape["createOpenCodeV2Client"]>>,
+  loadOpenCodeV2Inventory: ({ managed }) => {
+    runtimeMock.state.v2ManagedInputs.push(managed);
+    return Effect.succeed(runtimeMock.state.v2Inventory as OpenCodeV2Inventory);
   },
   loadOpenCodeInventory: () =>
     runtimeMock.state.inventoryError
@@ -516,6 +536,81 @@ it.layer(testLayer)("checkOpenCodeProviderStatus", (it) => {
     }),
   );
 
+  it.effect("maps managed OpenCode 2 inventory into a ready provider snapshot", () =>
+    Effect.gen(function* () {
+      runtimeMock.state.apiVersion = 2;
+      runtimeMock.state.v2Inventory = {
+        providers: [{ id: "openai", name: "OpenAI", activation: "enabled", package: "openai" }],
+        models: [
+          {
+            id: "openai/gpt-5.4",
+            modelID: "upstream-gpt-5.4",
+            providerID: "openai",
+            name: "GPT-5.4",
+            enabled: true,
+            variants: [{ id: "low" }, { id: "medium" }, { id: "high" }],
+          },
+        ],
+        agents: [
+          { id: "build-agent", name: "build", hidden: false, mode: "primary" },
+          { id: "explore", name: "explore", hidden: false, mode: "subagent" },
+        ],
+        skills: [
+          {
+            id: "review",
+            name: "review",
+            path: "/workspace/.opencode/skills/review/SKILL.md",
+            description: "Review changes",
+            content: "",
+          },
+        ],
+        commands: [{ name: "release", description: "Prepare a release" }],
+      };
+
+      const snapshot = yield* checkProvider(makeOpenCodeSettings());
+
+      NodeAssert.equal(snapshot.status, "ready");
+      NodeAssert.equal(snapshot.models[0]?.slug, "openai/gpt-5.4");
+      NodeAssert.equal(snapshot.models[0]?.subProvider, "OpenAI");
+      const agentDescriptor = snapshot.models[0]?.capabilities?.optionDescriptors?.find(
+        (descriptor) => descriptor.id === "agent" && descriptor.type === "select",
+      );
+      NodeAssert.ok(agentDescriptor && agentDescriptor.type === "select");
+      NodeAssert.deepEqual(agentDescriptor.options[0], {
+        id: "build-agent",
+        label: "Build",
+        isDefault: true,
+      });
+      NodeAssert.equal(agentDescriptor.currentValue, "build-agent");
+      NodeAssert.equal(snapshot.skills[0]?.path, "/workspace/.opencode/skills/review/SKILL.md");
+      NodeAssert.deepEqual(
+        snapshot.slashCommands.map((command) => command.name),
+        ["compact", "release"],
+      );
+      NodeAssert.deepEqual(runtimeMock.state.v2ManagedInputs, [true]);
+    }),
+  );
+
+  it.effect("keeps a persistent managed OpenCode 2 empty catalog in warning", () =>
+    Effect.gen(function* () {
+      runtimeMock.state.apiVersion = 2;
+      runtimeMock.state.v2Inventory = {
+        providers: [{ id: "openai", name: "OpenAI", activation: "enabled", package: "openai" }],
+        models: [],
+        agents: [],
+        skills: [],
+        commands: [],
+      };
+
+      const snapshot = yield* checkProvider(makeOpenCodeSettings());
+
+      NodeAssert.equal(snapshot.status, "warning");
+      NodeAssert.equal(snapshot.models.length, 0);
+      NodeAssert.match(snapshot.message ?? "", /did not report any available models/);
+      NodeAssert.deepEqual(runtimeMock.state.v2ManagedInputs, [true]);
+    }),
+  );
+
   it.effect("uses an environment-only password for local inventory", () =>
     Effect.gen(function* () {
       yield* checkProvider(makeOpenCodeSettings(), process.cwd(), {
@@ -561,6 +656,18 @@ it.layer(testLayer)("checkOpenCodeProviderStatus", (it) => {
 });
 
 it.layer(testLayer)("checkOpenCodeProviderStatus with configured server URL", (it) => {
+  it.effect("loads an external OpenCode 2 catalog without managed cold-start retries", () =>
+    Effect.gen(function* () {
+      runtimeMock.state.apiVersion = 2;
+      const snapshot = yield* checkProvider(
+        makeOpenCodeSettings({ serverUrl: "http://127.0.0.1:9999" }),
+      );
+
+      NodeAssert.equal(snapshot.status, "warning");
+      NodeAssert.deepEqual(runtimeMock.state.v2ManagedInputs, [false]);
+    }),
+  );
+
   it.effect("does not send a local environment password to a configured server", () =>
     Effect.gen(function* () {
       const snapshot = yield* checkProvider(

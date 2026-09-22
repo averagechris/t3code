@@ -36,7 +36,7 @@ import {
 } from "../Layers/OpenCodeProvider.ts";
 import { ProviderEventLoggers } from "../Layers/ProviderEventLoggers.ts";
 import { makeManagedServerProvider } from "../makeManagedServerProvider.ts";
-import { OpenCodeRuntime, loadOpenCodeCommands } from "../opencodeRuntime.ts";
+import { OpenCodeRuntime, OpenCodeRuntimeError, loadOpenCodeCommands } from "../opencodeRuntime.ts";
 import * as OpenCodeServerOwner from "../OpenCodeServerOwner.ts";
 import {
   defaultProviderContinuationIdentity,
@@ -187,6 +187,56 @@ export const OpenCodeDriver: ProviderDriver<OpenCodeSettings, OpenCodeDriverEnv>
           },
           { concurrency: "unbounded" },
         );
+      const loadWorkspaceFromServer = (
+        server: {
+          readonly url: string;
+          readonly serverPassword?: string;
+          readonly apiVersion?: 1 | 2;
+        },
+        cwd: string,
+        managed: boolean,
+      ) =>
+        Effect.gen(function* () {
+          if (server.apiVersion !== 2) {
+            return yield* loadWorkspaceInventory(
+              openCodeRuntime.createOpenCodeSdkClient({
+                baseUrl: server.url,
+                directory: cwd,
+                ...(server.serverPassword !== undefined
+                  ? { serverPassword: server.serverPassword }
+                  : {}),
+              }),
+            );
+          }
+          if (!openCodeRuntime.createOpenCodeV2Client || !openCodeRuntime.loadOpenCodeV2Inventory) {
+            return yield* new OpenCodeRuntimeError({
+              operation: "loadOpenCodeV2Inventory",
+              detail: "OpenCode 2 inventory support is unavailable.",
+            });
+          }
+          const inventory = yield* openCodeRuntime.loadOpenCodeV2Inventory({
+            client: openCodeRuntime.createOpenCodeV2Client({
+              baseUrl: server.url,
+              ...(server.serverPassword !== undefined
+                ? { serverPassword: server.serverPassword }
+                : {}),
+            }),
+            directory: cwd,
+            managed,
+          });
+          return {
+            skills: inventory.skills.map((skill) => ({
+              name: skill.name,
+              ...(skill.description === undefined ? {} : { description: skill.description }),
+              location: skill.path,
+            })),
+            commands: inventory.commands.map((command) => ({
+              name: command.name,
+              ...(command.description === undefined ? {} : { description: command.description }),
+              hints: [],
+            })),
+          };
+        });
       const loadWorkspaceForCwd = (cwd: string) =>
         effectiveConfig.serverUrl.trim().length > 0
           ? Effect.scoped(
@@ -200,27 +250,10 @@ export const OpenCodeDriver: ProviderDriver<OpenCodeSettings, OpenCodeDriverEnv>
                     : {}),
                   environment: processEnv,
                 });
-                const client = openCodeRuntime.createOpenCodeSdkClient({
-                  baseUrl: server.url,
-                  directory: cwd,
-                  ...(effectiveConfig.serverPassword
-                    ? { serverPassword: effectiveConfig.serverPassword }
-                    : {}),
-                });
-                return yield* loadWorkspaceInventory(client);
+                return yield* loadWorkspaceFromServer(server, cwd, false);
               }),
             )
-          : serverOwner.withServer((server) =>
-              loadWorkspaceInventory(
-                openCodeRuntime.createOpenCodeSdkClient({
-                  baseUrl: server.url,
-                  directory: cwd,
-                  ...(server.serverPassword !== undefined
-                    ? { serverPassword: server.serverPassword }
-                    : {}),
-                }),
-              ),
-            );
+          : serverOwner.withServer((server) => loadWorkspaceFromServer(server, cwd, true));
 
       const snapshotSettings = makeProviderSnapshotSettingsSource(effectiveConfig, serverSettings);
       const snapshot = yield* makeManagedServerProvider<ProviderSnapshotSettings<OpenCodeSettings>>(

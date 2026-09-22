@@ -23,6 +23,10 @@ const runtimeMock = {
     authHeaders: [] as Array<string | null>,
     closeCalls: [] as string[],
     sessionCreateCalls: 0,
+    apiVersion: 1 as 1 | 2,
+    generateTextCalls: [] as Array<{ prompt: string; model?: unknown; baseUrl: string }>,
+    generateTextError: undefined as unknown,
+    generateTextResult: undefined as { text: string } | undefined,
     connectionError: undefined as Error | undefined,
     sessionCreateError: undefined as unknown,
     sessionResult: undefined as { data?: { id: string } } | undefined,
@@ -38,6 +42,10 @@ const runtimeMock = {
     this.state.authHeaders.length = 0;
     this.state.closeCalls.length = 0;
     this.state.sessionCreateCalls = 0;
+    this.state.apiVersion = 1;
+    this.state.generateTextCalls.length = 0;
+    this.state.generateTextError = undefined;
+    this.state.generateTextResult = undefined;
     this.state.connectionError = undefined;
     this.state.sessionCreateError = undefined;
     this.state.sessionResult = undefined;
@@ -70,6 +78,7 @@ const OpenCodeRuntimeTestDouble: OpenCodeRuntime.OpenCodeRuntimeShape = {
           ? { serverPassword: effectiveServerPassword }
           : {}),
         version: "1.14.19",
+        apiVersion: runtimeMock.state.apiVersion,
         isRunning: Effect.succeed(true),
         exitCode: Effect.never,
       };
@@ -87,6 +96,7 @@ const OpenCodeRuntimeTestDouble: OpenCodeRuntime.OpenCodeRuntimeShape = {
           url: serverUrl ?? "http://127.0.0.1:4301",
           ...(serverPassword ? { serverPassword } : {}),
           version: "1.14.19",
+          apiVersion: runtimeMock.state.apiVersion,
           exitCode: null,
           external: Boolean(serverUrl),
         }),
@@ -128,6 +138,35 @@ const OpenCodeRuntimeTestDouble: OpenCodeRuntime.OpenCodeRuntimeShape = {
         },
       },
     }) as unknown as ReturnType<OpenCodeRuntime.OpenCodeRuntimeShape["createOpenCodeSdkClient"]>,
+  createOpenCodeV2Client: ({ baseUrl, serverPassword }) =>
+    ({
+      generate: {
+        text: async (input: { prompt: string; model?: unknown }) => {
+          runtimeMock.state.generateTextCalls.push({ ...input, baseUrl });
+          runtimeMock.state.authHeaders.push(
+            serverPassword ? `Basic ${btoa(`opencode:${serverPassword}`)}` : null,
+          );
+          if (runtimeMock.state.generateTextError !== undefined) {
+            throw runtimeMock.state.generateTextError;
+          }
+          return (
+            runtimeMock.state.generateTextResult ?? {
+              text: '{"subject":"Generate without tools","body":"Use the native endpoint."}',
+            }
+          );
+        },
+      },
+      session: {
+        create: async () => {
+          throw new Error("V2 text generation must not create a session");
+        },
+        prompt: async () => {
+          throw new Error("V2 text generation must not prompt a session");
+        },
+      },
+    }) as unknown as ReturnType<
+      NonNullable<OpenCodeRuntime.OpenCodeRuntimeShape["createOpenCodeV2Client"]>
+    >,
   loadOpenCodeInventory: () =>
     Effect.fail(
       new OpenCodeRuntime.OpenCodeRuntimeError({
@@ -543,6 +582,102 @@ it.layer(OpenCodeTextGenerationTestLayer)("OpenCodeTextGeneration", (it) => {
       }),
     ),
   );
+
+  it.effect("uses OpenCode 2 generate.text without creating a session", () =>
+    withOpenCodeTextGeneration(LOCAL_AUTH_OPENCODE_SETTINGS, (textGeneration) =>
+      Effect.gen(function* () {
+        runtimeMock.state.apiVersion = 2;
+
+        const result = yield* textGeneration.generateCommitMessage({
+          ...DEFAULT_COMMIT_MESSAGE_INPUT,
+          modelSelection: {
+            ...DEFAULT_TEST_MODEL_SELECTION,
+            options: [{ id: "variant", value: "high" }],
+          },
+        });
+
+        expect(result.subject).toBe("Generate without tools");
+        expect(runtimeMock.state.sessionCreateCalls).toBe(0);
+        expect(runtimeMock.state.generateTextCalls).toEqual([
+          {
+            baseUrl: "http://127.0.0.1:4301",
+            prompt: expect.stringContaining("feature/opencode-reuse"),
+            model: { providerID: "openai", id: "gpt-5", variant: "high" },
+          },
+        ]);
+        expect(runtimeMock.state.authHeaders).toEqual([
+          `Basic ${btoa("opencode:secret-password")}`,
+        ]);
+      }),
+    ),
+  );
+
+  it.effect("preserves OpenCode 2 request errors and typed empty output", () =>
+    withOpenCodeTextGeneration(DEFAULT_OPENCODE_SETTINGS, (textGeneration) =>
+      Effect.gen(function* () {
+        runtimeMock.state.apiVersion = 2;
+        const sdkCause = new Error("unauthorized");
+        runtimeMock.state.generateTextError = sdkCause;
+        const requestError = yield* textGeneration
+          .generateCommitMessage(DEFAULT_COMMIT_MESSAGE_INPUT)
+          .pipe(Effect.flip);
+        expect(requestError.cause).toMatchObject({
+          _tag: "OpenCodeTextGenerationGenerateRequestError",
+          cause: sdkCause,
+        });
+        expect(requestError.message).toContain("server's global provider configuration");
+
+        runtimeMock.state.generateTextError = undefined;
+        runtimeMock.state.generateTextResult = { text: "  " };
+        const emptyError = yield* textGeneration
+          .generateCommitMessage(DEFAULT_COMMIT_MESSAGE_INPUT)
+          .pipe(Effect.flip);
+        expect(emptyError.cause).toMatchObject({
+          _tag: "OpenCodeTextGenerationEmptyOutputError",
+          responsePartCount: 1,
+          textPartCount: 1,
+        });
+        expect(emptyError.cause).not.toHaveProperty("sessionId");
+      }),
+    ),
+  );
+
+  it.effect("rejects OpenCode 2 inputs generate.text cannot honor", () =>
+    withOpenCodeTextGeneration(DEFAULT_OPENCODE_SETTINGS, (textGeneration) =>
+      Effect.gen(function* () {
+        runtimeMock.state.apiVersion = 2;
+        const agentError = yield* textGeneration
+          .generateCommitMessage({
+            ...DEFAULT_COMMIT_MESSAGE_INPUT,
+            modelSelection: {
+              ...DEFAULT_TEST_MODEL_SELECTION,
+              options: [{ id: "agent", value: "reviewer" }],
+            },
+          })
+          .pipe(Effect.flip);
+        expect(agentError.message).toContain("does not support selecting an agent");
+
+        const imageError = yield* textGeneration
+          .generateThreadTitle({
+            cwd: process.cwd(),
+            message: "Describe this image",
+            modelSelection: DEFAULT_TEST_MODEL_SELECTION,
+            attachments: [
+              {
+                type: "image",
+                id: "image",
+                name: "image.png",
+                mimeType: "image/png",
+                sizeBytes: 1,
+              },
+            ],
+          })
+          .pipe(Effect.flip);
+        expect(imageError.message).toContain("does not support image attachments");
+        expect(runtimeMock.state.generateTextCalls).toEqual([]);
+      }),
+    ),
+  );
 });
 
 it.layer(OpenCodeTextGenerationExistingServerTestLayer)(
@@ -557,6 +692,23 @@ it.layer(OpenCodeTextGenerationExistingServerTestLayer)(
             expect(runtimeMock.state.authHeaders).toEqual([null]);
           }),
         { OPENCODE_SERVER_PASSWORD: "local-secret" },
+      ),
+    );
+
+    it.effect("uses an authenticated external OpenCode 2 server without spawning", () =>
+      withOpenCodeTextGeneration(EXISTING_SERVER_OPENCODE_SETTINGS, (textGeneration) =>
+        Effect.gen(function* () {
+          runtimeMock.state.apiVersion = 2;
+
+          yield* textGeneration.generateCommitMessage(DEFAULT_COMMIT_MESSAGE_INPUT);
+
+          expect(runtimeMock.state.startCalls).toEqual([]);
+          expect(runtimeMock.state.sessionCreateCalls).toBe(0);
+          expect(runtimeMock.state.generateTextCalls[0]?.baseUrl).toBe("http://127.0.0.1:9999");
+          expect(runtimeMock.state.authHeaders).toEqual([
+            `Basic ${btoa("opencode:secret-password")}`,
+          ]);
+        }),
       ),
     );
 

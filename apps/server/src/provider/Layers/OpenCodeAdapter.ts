@@ -69,6 +69,7 @@ const PROVIDER = ProviderDriverKind.make("opencode");
  * rather than misread (mirrors GROK_RESUME_VERSION / CURSOR_RESUME_VERSION).
  */
 const OPENCODE_RESUME_VERSION = 1 as const;
+const OPENCODE_V2_RECOVERY_DEADLINE_MS = 5_000;
 
 /**
  * Decode a persisted resume cursor into the upstream `ses_…` id. Anything
@@ -96,7 +97,8 @@ function parseOpenCodeResume(raw: unknown): { readonly sessionId: string } | und
  * is `throwOnError: true`, so `session.get` rejects on every non-2xx) must
  * propagate, or a transient blip resets a live thread to an empty one — the
  * #3604 silent context loss. Decides on structured signals only, never free
- * text: a numeric 404 or the exact `NotFoundError` name, found via a bounded walk
+ * text: a numeric 404, or the exact `NotFoundError` / `SessionNotFoundError`
+ * tag or name, found via a bounded walk
  * over `cause`/`body`/`error`/`data`. An explicit non-404 status seals its
  * subtree so a wrapped "NotFound" name can't reclassify a real failure.
  * Exported for unit testing.
@@ -128,7 +130,11 @@ export function isOpenCodeNotFound(cause: unknown): boolean {
     }
 
     const name = record.name;
-    if (typeof name === "string" && name.toLowerCase() === "notfounderror") {
+    const tag = record._tag;
+    if (
+      (typeof name === "string" && name.toLowerCase() === "notfounderror") ||
+      tag === "SessionNotFoundError"
+    ) {
       return true;
     }
 
@@ -193,6 +199,7 @@ const OpenCodeSessionStatusMap = Schema.Record(
   Schema.Struct({ type: Schema.String }),
 );
 const decodeOpenCodeSessionStatusMap = Schema.decodeUnknownOption(OpenCodeSessionStatusMap);
+const encodeOpenCodePartSignature = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 
 interface OpenCodeCancellation {
   readonly turnId: TurnId | undefined;
@@ -353,6 +360,7 @@ interface OpenCodeSessionContext {
   // OpenCode permits edits to completed parts. Keep text for snapshot comparison
   // until native removal or session teardown, but do not retain other part payloads.
   readonly textPartsByMessageId: Map<string, Map<string, OpenCodeTextPartState>>;
+  readonly toolPartSignatures: Map<string, string>;
   turnTokenUsage: OpenCodeTurnTokenUsageAccumulator | undefined;
   activeTurnId: TurnId | undefined;
   activeAgent: string | undefined;
@@ -360,6 +368,7 @@ interface OpenCodeSessionContext {
   cancellation: OpenCodeCancellation | undefined;
   interruptedTurnId: TurnId | undefined;
   reconcileIdleStatus: boolean;
+  requiresOutputReconciliation: boolean;
   awaitingBusyAfterInterruption: boolean;
   pendingIdleReconciliation: OpenCodeIdleReconciliation | undefined;
   pendingRequestRecovery: OpenCodePendingRequestRecovery | undefined;
@@ -552,12 +561,12 @@ function mapPermissionToRequestType(
   }
 }
 
-function mapPermissionDecision(reply: "once" | "always" | "reject"): string {
+function mapPermissionDecision(reply: "once" | "always" | "reject", apiVersion: 1 | 2 = 1): string {
   switch (reply) {
     case "once":
       return "accept";
     case "always":
-      return "acceptForSession";
+      return apiVersion === 2 ? "acceptAlways" : "acceptForSession";
     case "reject":
     default:
       return "decline";
@@ -1109,11 +1118,19 @@ export function makeOpenCodeAdapter(
       }
     });
 
+    let reconcileOpenCodeOutput: (
+      context: OpenCodeSessionContext,
+      turnId: TurnId,
+      promptGeneration: number,
+      deadlineMs?: number,
+    ) => Effect.Effect<boolean, ProviderAdapterRequestError> = () => Effect.succeed(true);
+
     const completeOpenCodeTurn = Effect.fn("completeOpenCodeTurn")(function* (
       context: OpenCodeSessionContext,
       turnId: TurnId,
       promptGeneration: number,
       raw: unknown,
+      deadlineMs?: number,
     ) {
       const updatedAt = yield* nowIso;
       const stopped = yield* Ref.get(context.stopped);
@@ -1123,7 +1140,18 @@ export function makeOpenCodeAdapter(
         context.promptGeneration !== promptGeneration ||
         context.cancellation?.turnId === turnId
       ) {
-        return;
+        return false;
+      }
+      if (!(yield* reconcileOpenCodeOutput(context, turnId, promptGeneration, deadlineMs))) {
+        return false;
+      }
+      if (
+        (yield* Ref.get(context.stopped)) ||
+        context.activeTurnId !== turnId ||
+        context.promptGeneration !== promptGeneration ||
+        context.cancellation?.turnId === turnId
+      ) {
+        return false;
       }
       const pendingIdleReconciliation = context.pendingIdleReconciliation;
       if (
@@ -1136,6 +1164,7 @@ export function makeOpenCodeAdapter(
       context.activeTurnId = undefined;
       context.activeAgent = undefined;
       context.activeVariant = undefined;
+      context.toolPartSignatures.clear();
       context.interruptedTurnId = undefined;
       context.awaitingBusyAfterInterruption = false;
       context.reconcileIdleStatus = false;
@@ -1149,9 +1178,6 @@ export function makeOpenCodeAdapter(
         { clearActiveTurnId: true },
         updatedAt,
       );
-      if (pendingIdleReconciliation?.fiber) {
-        yield* Fiber.interrupt(pendingIdleReconciliation.fiber);
-      }
       yield* schedulePendingRequestRecovery(context);
       yield* emit({
         ...(yield* buildEventBase({
@@ -1164,6 +1190,55 @@ export function makeOpenCodeAdapter(
           state: "completed",
           tokenUsage,
         },
+      });
+      return true;
+    });
+
+    const failIdleReconciliation = Effect.fn("failIdleReconciliation")(function* (
+      context: OpenCodeSessionContext,
+      pending: OpenCodeIdleReconciliation,
+      outputMissing: boolean,
+    ) {
+      const turnId = pending.turnId;
+      if (
+        context.pendingIdleReconciliation !== pending ||
+        context.activeTurnId !== turnId ||
+        context.promptGeneration !== pending.promptGeneration ||
+        context.cancellation?.turnId === turnId ||
+        (yield* Ref.get(context.stopped))
+      )
+        return;
+      const detail = outputMissing
+        ? "OpenCode turn output could not be recovered after reconnecting; the turn was not completed successfully."
+        : "OpenCode turn status could not be confirmed after reconnecting; the turn was not completed successfully.";
+      // Retire the pending work before any yielding emits. A late idle or a
+      // cancellation must not settle this turn a second time.
+      context.pendingIdleReconciliation = undefined;
+      const tokenUsage = takeOpenCodeTurnTokenUsage(context, false);
+      context.activeTurnId = undefined;
+      context.activeAgent = undefined;
+      context.activeVariant = undefined;
+      context.toolPartSignatures.clear();
+      context.reconcileIdleStatus = false;
+      context.requiresOutputReconciliation = false;
+      yield* updateProviderSession(
+        context,
+        { status: "error", lastError: detail },
+        { clearActiveTurnId: true },
+      );
+      yield* emit({
+        ...(yield* buildEventBase({
+          threadId: context.session.threadId,
+          turnId,
+          raw: pending.raw,
+        })),
+        type: "turn.completed",
+        payload: { state: "failed", errorMessage: detail, tokenUsage },
+      });
+      yield* emit({
+        ...(yield* buildEventBase({ threadId: context.session.threadId, turnId })),
+        type: "runtime.error",
+        payload: { message: detail, class: "transport_error" },
       });
     });
 
@@ -1188,22 +1263,40 @@ export function makeOpenCodeAdapter(
         dirty: false,
       };
       context.pendingIdleReconciliation = pending;
+      // One budget covers status uncertainty AND lagging durable output. A
+      // successful idle poll must not restart the clock when history lags.
+      const deadlineMs =
+        context.server.apiVersion === 2
+          ? DateTime.toEpochMillis(yield* DateTime.now) + OPENCODE_V2_RECOVERY_DEADLINE_MS
+          : undefined;
       const reconcile = Effect.gen(function* () {
         let retryCount = 0;
+        let outputMissing = false;
         while (context.pendingIdleReconciliation === pending) {
           if (
             context.activeTurnId !== turnId ||
             context.awaitingBusyAfterInterruption ||
-            context.promptGeneration !== pending.promptGeneration
+            context.promptGeneration !== pending.promptGeneration ||
+            context.cancellation?.turnId === turnId ||
+            (yield* Ref.get(context.stopped))
           ) {
             context.pendingIdleReconciliation = undefined;
             return;
           }
-          const result = yield* runOpenCodeSdk("session.status", (signal) =>
+          const remainingMs =
+            deadlineMs === undefined
+              ? undefined
+              : deadlineMs - DateTime.toEpochMillis(yield* DateTime.now);
+          if (remainingMs !== undefined && remainingMs <= 0) {
+            yield* failIdleReconciliation(context, pending, outputMissing);
+            return;
+          }
+          const statusCheck = runOpenCodeSdk("session.status", (signal) =>
             context.client.session.status(undefined, { signal }),
+          ).pipe(Effect.timeout(`${Math.min(remainingMs ?? 1_000, 1_000)} millis`));
+          const result = yield* (
+            deadlineMs === undefined ? statusCheck.pipe(Effect.retry({ times: 1 })) : statusCheck
           ).pipe(
-            Effect.timeout("1 second"),
-            Effect.retry({ times: 1 }),
             Effect.match({
               onFailure: (cause) => ({ type: "unknown" as const, cause }),
               onSuccess: (response) => {
@@ -1226,14 +1319,35 @@ export function makeOpenCodeAdapter(
           if (
             context.pendingIdleReconciliation !== pending ||
             context.activeTurnId !== turnId ||
-            context.promptGeneration !== pending.promptGeneration
+            context.promptGeneration !== pending.promptGeneration ||
+            context.cancellation?.turnId === turnId ||
+            (yield* Ref.get(context.stopped))
           ) {
             return;
           }
           if (result.type === "idle") {
-            context.pendingIdleReconciliation = undefined;
-            yield* completeOpenCodeTurn(context, turnId, pending.promptGeneration, pending.raw);
-            return;
+            const completed = yield* completeOpenCodeTurn(
+              context,
+              turnId,
+              pending.promptGeneration,
+              pending.raw,
+              deadlineMs,
+            );
+            if (completed) return;
+            if (
+              context.pendingIdleReconciliation !== pending ||
+              context.activeTurnId !== turnId ||
+              context.promptGeneration !== pending.promptGeneration ||
+              context.cancellation?.turnId === turnId ||
+              (yield* Ref.get(context.stopped))
+            ) {
+              return;
+            }
+            if (deadlineMs === undefined) {
+              // V1 has no output-history requirement; only V2 reaches here.
+              return;
+            }
+            outputMissing = true;
           }
           if (result.type === "busy") {
             if (pending.dirty) {
@@ -1243,7 +1357,7 @@ export function makeOpenCodeAdapter(
             context.pendingIdleReconciliation = undefined;
             return;
           }
-          if (!pending.warned) {
+          if (result.type === "unknown" && !pending.warned) {
             pending.warned = true;
             yield* emit({
               ...(yield* buildEventBase({ threadId: context.session.threadId, turnId })),
@@ -1257,9 +1371,16 @@ export function makeOpenCodeAdapter(
               },
             });
           }
-          const delayMs = Math.min(250 * 2 ** retryCount, 5_000);
+          const delayMs = Math.min(250 * 2 ** retryCount, deadlineMs === undefined ? 5_000 : 1_000);
           retryCount += 1;
-          yield* Effect.sleep(`${delayMs} millis`);
+          const sleepMs =
+            deadlineMs === undefined
+              ? delayMs
+              : Math.min(
+                  delayMs,
+                  Math.max(0, deadlineMs - DateTime.toEpochMillis(yield* DateTime.now)),
+                );
+          yield* Effect.sleep(`${sleepMs} millis`);
         }
       }).pipe(
         Effect.catchCause(() => Effect.void),
@@ -1458,15 +1579,17 @@ export function makeOpenCodeAdapter(
             if (promptAdmission.idleStatusConfirmations >= 2) {
               context.promptAdmission = undefined;
               context.awaitingBusyAfterInterruption = false;
-              yield* completeOpenCodeTurn(
-                context,
-                promptAdmission.turnId,
-                promptAdmission.generation,
-                {
-                  type: "session.status.recovered",
-                  status: statusData,
-                },
-              );
+              const raw = { type: "session.status.recovered", status: statusData };
+              if (context.requiresOutputReconciliation) {
+                yield* scheduleIdleReconciliation(context, promptAdmission.turnId, raw);
+              } else {
+                yield* completeOpenCodeTurn(
+                  context,
+                  promptAdmission.turnId,
+                  promptAdmission.generation,
+                  raw,
+                );
+              }
               return;
             }
           } else if (!isIdle) {
@@ -1761,15 +1884,27 @@ export function makeOpenCodeAdapter(
           requestType: mapPermissionToRequestType(request.permission),
           detail,
           args: request.metadata,
-          options: [
-            { decision: "accept", label: "Allow once" },
-            {
-              decision: "acceptForSession",
-              label: "Allow for workspace",
-              warning: "Applies to matching requests in other OpenCode sessions in this workspace.",
-            },
-            { decision: "decline", label: "Deny" },
-          ],
+          options:
+            context.server.apiVersion === 2
+              ? [
+                  { decision: "accept", label: "Allow once" },
+                  {
+                    decision: "acceptAlways",
+                    label: "Always allow for project",
+                    warning: "Applies to matching requests in this OpenCode project.",
+                  },
+                  { decision: "decline", label: "Deny" },
+                ]
+              : [
+                  { decision: "accept", label: "Allow once" },
+                  {
+                    decision: "acceptForSession",
+                    label: "Allow for workspace",
+                    warning:
+                      "Applies to matching requests in other OpenCode sessions in this workspace.",
+                  },
+                  { decision: "decline", label: "Deny" },
+                ],
         },
       });
     });
@@ -1897,7 +2032,7 @@ export function makeOpenCodeAdapter(
           type: "request.resolved",
           payload: {
             requestType: request ? mapPermissionToRequestType(request.permission) : "unknown",
-            decision: mapPermissionDecision(event.properties.reply),
+            decision: mapPermissionDecision(event.properties.reply, context.server.apiVersion ?? 1),
           },
         });
         return;
@@ -2395,6 +2530,10 @@ export function makeOpenCodeAdapter(
         case "message.removed": {
           context.messageRoleById.delete(event.properties.messageID);
           context.textPartsByMessageId.delete(event.properties.messageID);
+          for (const key of context.toolPartSignatures.keys()) {
+            if (key.startsWith(`${event.properties.messageID}:`))
+              context.toolPartSignatures.delete(key);
+          }
           break;
         }
 
@@ -2404,6 +2543,9 @@ export function makeOpenCodeAdapter(
           if (parts?.size === 0) {
             context.textPartsByMessageId.delete(event.properties.messageID);
           }
+          context.toolPartSignatures.delete(
+            `${event.properties.messageID}:${event.properties.partID}`,
+          );
           break;
         }
 
@@ -2483,6 +2625,17 @@ export function makeOpenCodeAdapter(
           }
 
           if (part.type === "tool") {
+            const signatureKey = `${part.messageID}:${part.id}`;
+            const signature = encodeOpenCodePartSignature(part);
+            if (
+              context.server.apiVersion === 2 &&
+              context.toolPartSignatures.get(signatureKey) === signature
+            ) {
+              break;
+            }
+            if (context.server.apiVersion === 2) {
+              context.toolPartSignatures.set(signatureKey, signature);
+            }
             const itemType = toToolLifecycleItemType(part.tool);
             const title =
               part.state.status === "running" || part.state.status === "completed"
@@ -2638,6 +2791,10 @@ export function makeOpenCodeAdapter(
               yield* scheduleIdleReconciliation(context, turnId, event);
               break;
             }
+            if (context.requiresOutputReconciliation) {
+              yield* scheduleIdleReconciliation(context, turnId, event);
+              break;
+            }
             yield* completeOpenCodeTurn(context, turnId, context.promptGeneration, event);
           }
           break;
@@ -2725,6 +2882,90 @@ export function makeOpenCodeAdapter(
       }
     });
 
+    reconcileOpenCodeOutput = (context, turnId, promptGeneration, deadlineMs) =>
+      Effect.gen(function* () {
+        if (context.server.apiVersion !== 2 || !context.requiresOutputReconciliation) {
+          return true;
+        }
+        const remainingMs =
+          deadlineMs === undefined
+            ? 10_000
+            : Math.max(1, deadlineMs - DateTime.toEpochMillis(yield* DateTime.now));
+        const response = yield* runOpenCodeSdk("session.messages", (signal) =>
+          context.client.session.messages({ sessionID: context.openCodeSessionId }, { signal }),
+        ).pipe(
+          Effect.timeout(`${remainingMs} millis`),
+          Effect.match({
+            onFailure: (cause) => ({
+              type: "failure" as const,
+              detail: openCodeRuntimeErrorDetail(cause),
+            }),
+            onSuccess: (value) => ({ type: "success" as const, data: value.data }),
+          }),
+        );
+        if (
+          (yield* Ref.get(context.stopped)) ||
+          context.activeTurnId !== turnId ||
+          context.promptGeneration !== promptGeneration
+        ) {
+          return false;
+        }
+        const promptIds = context.turnTokenUsage?.promptMessageIds ?? new Set<string>();
+        const messages = response.type === "success" ? response.data : undefined;
+        const promptIndex =
+          messages?.findLastIndex((message) => promptIds.has(message.info.id)) ?? -1;
+        const assistantMessages =
+          messages?.slice(promptIndex + 1).filter((message) => message.info.role === "assistant") ??
+          [];
+        // The prompt can be durable before any assistant output is persisted. A
+        // prompt-only (or empty assistant) snapshot cannot prove completion.
+        const hasOutput = assistantMessages.some((message) =>
+          message.parts.some(
+            (part) =>
+              ((part.type === "text" || part.type === "reasoning") && part.text.length > 0) ||
+              (part.type === "tool" &&
+                (part.state.status === "completed" || part.state.status === "error")),
+          ),
+        );
+        if (
+          response.type === "failure" ||
+          messages === undefined ||
+          promptIndex < 0 ||
+          !hasOutput
+        ) {
+          yield* emit({
+            ...(yield* buildEventBase({ threadId: context.session.threadId, turnId })),
+            type: "runtime.warning",
+            payload: {
+              message: "OpenCode output recovery failed; turn completion is waiting for history.",
+              detail:
+                response.type === "failure"
+                  ? response.detail
+                  : messages === undefined
+                    ? "session.messages returned no data."
+                    : promptIndex < 0
+                      ? "session.messages did not contain the active prompt."
+                      : "session.messages did not contain durable assistant output after the active prompt.",
+            },
+          });
+          return false;
+        }
+        for (const message of assistantMessages) {
+          yield* handleSubscribedEvent(context, {
+            type: "message.updated",
+            properties: { sessionID: context.openCodeSessionId, info: message.info },
+          } as OpenCodeSubscribedEvent);
+          for (const part of message.parts) {
+            yield* handleSubscribedEvent(context, {
+              type: "message.part.updated",
+              properties: { sessionID: context.openCodeSessionId, part },
+            } as OpenCodeSubscribedEvent);
+          }
+        }
+        context.requiresOutputReconciliation = false;
+        return true;
+      });
+
     const startEventPump = Effect.fn("startEventPump")(function* (context: OpenCodeSessionContext) {
       // One AbortController per session scope. The finalizer fires when
       // the scope closes (explicit stop, unexpected exit, or layer
@@ -2764,6 +3005,7 @@ export function makeOpenCodeAdapter(
             signal: eventsAbortController.signal,
             onSseError: (cause) => {
               lastStreamError = cause;
+              if (context.server.apiVersion === 2) context.requiresOutputReconciliation = true;
               Queue.offerUnsafe(streamErrors, cause);
             },
           }),
@@ -2864,6 +3106,7 @@ export function makeOpenCodeAdapter(
               const client = openCodeRuntime.createOpenCodeSdkClient({
                 baseUrl: server.url,
                 directory,
+                apiVersion: server.apiVersion ?? 1,
                 ...(server.serverPassword ? { serverPassword: server.serverPassword } : {}),
               });
               if (mcpSession && !server.external) {
@@ -2913,7 +3156,10 @@ export function makeOpenCodeAdapter(
                   yield* runOpenCodeSdk("session.update", () =>
                     client.session.update({
                       sessionID: reusable.id,
-                      permission: buildOpenCodePermissionRules(input.runtimeMode),
+                      permission: buildOpenCodePermissionRules(
+                        input.runtimeMode,
+                        server.apiVersion ?? 1,
+                      ),
                     }),
                   );
                   return { openCodeSession: reusable, created: false };
@@ -2940,7 +3186,10 @@ export function makeOpenCodeAdapter(
                   yield* runOpenCodeSdk("session.update", () =>
                     client.session.update({
                       sessionID: forked.id,
-                      permission: buildOpenCodePermissionRules(input.runtimeMode),
+                      permission: buildOpenCodePermissionRules(
+                        input.runtimeMode,
+                        server.apiVersion ?? 1,
+                      ),
                     }),
                   );
                   return { openCodeSession: forked, created: true };
@@ -2954,7 +3203,10 @@ export function makeOpenCodeAdapter(
                 const createdSession = yield* runOpenCodeSdk("session.create", () =>
                   client.session.create({
                     ...(input.title ? { title: input.title } : {}),
-                    permission: buildOpenCodePermissionRules(input.runtimeMode),
+                    permission: buildOpenCodePermissionRules(
+                      input.runtimeMode,
+                      server.apiVersion ?? 1,
+                    ),
                   }),
                 );
                 if (!createdSession.data) {
@@ -3016,6 +3268,7 @@ export function makeOpenCodeAdapter(
           pendingPermissions: new Map(),
           pendingQuestions: new Map(),
           textPartsByMessageId: new Map(),
+          toolPartSignatures: new Map(),
           messageRoleById: new Map(),
           turnTokenUsage: undefined,
           activeTurnId: undefined,
@@ -3024,6 +3277,7 @@ export function makeOpenCodeAdapter(
           cancellation: undefined,
           interruptedTurnId: undefined,
           reconcileIdleStatus: false,
+          requiresOutputReconciliation: false,
           awaitingBusyAfterInterruption: false,
           pendingIdleReconciliation: undefined,
           pendingRequestRecovery: undefined,
@@ -3245,8 +3499,8 @@ export function makeOpenCodeAdapter(
 
           let promptTimedOut = false;
           const submissionMethod = nativeCommand ? "session.command" : "session.promptAsync";
-          // Native commands expand provider-owned templates. Their API does not
-          // accept the per-turn system addendum supported by ordinary prompts.
+          // Native commands expand provider-owned templates. V2 installs the
+          // same runtime addendum as a session instruction entry before execution.
           const submission = nativeCommand
             ? Effect.raceFirst(
                 runOpenCodeSdk("session.command", (signal) =>
@@ -3260,6 +3514,14 @@ export function makeOpenCodeAdapter(
                       ...(context.activeAgent ? { agent: context.activeAgent } : {}),
                       ...(context.activeVariant ? { variant: context.activeVariant } : {}),
                       parts: fileParts,
+                      ...(context.server.apiVersion === 2
+                        ? {
+                            system: buildRuntimeInstructions({
+                              harness: "OpenCode",
+                              model: `${parsedModel.providerID}/${parsedModel.modelID}`,
+                            }),
+                          }
+                        : {}),
                     },
                     { signal },
                   ),
@@ -3758,7 +4020,7 @@ export function makeOpenCodeAdapter(
         });
       }
 
-      const reply = toOpenCodePermissionReply(decision);
+      const reply = toOpenCodePermissionReply(decision, context.server.apiVersion ?? 1);
       yield* runOpenCodeSdk("permission.reply", (signal) =>
         context.client.permission.reply(
           {
@@ -3791,6 +4053,9 @@ export function makeOpenCodeAdapter(
         },
         { type: "permission.reply", requestID: requestId, reply },
       );
+      if (context.server.apiVersion === 2 && decision === "decline") {
+        yield* schedulePendingRequestRecovery(context);
+      }
     });
 
     const respondToUserInput: OpenCodeAdapterShape["respondToUserInput"] = Effect.fn(
@@ -3967,7 +4232,10 @@ export function makeOpenCodeAdapter(
           yield* runOpenCodeSdk("session.update", () =>
             context.client.session.update({
               sessionID: forkedSessionId,
-              permission: buildOpenCodePermissionRules(context.session.runtimeMode),
+              permission: buildOpenCodePermissionRules(
+                context.session.runtimeMode,
+                context.server.apiVersion ?? 1,
+              ),
             }),
           ).pipe(Effect.mapError(toRequestError));
           yield* clearPendingOpenCodeRequests(context, { type: "session.fork" });

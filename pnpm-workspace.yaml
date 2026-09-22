@@ -54,6 +54,9 @@ catalog:
   yaml: ^2.9.0
 
 minimumReleaseAgeExclude:
+  - "@opencode/client@2.0.8"
+  - "@opencode/protocol@2.0.8"
+  - "@opencode/schema@2.0.8"
   - "@clerk/backend@3.18.1"
   - "@clerk/clerk-js@6.32.1"
   - "@clerk/electron@0.0.44"

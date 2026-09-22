@@ -66,7 +66,7 @@ export class OpenCodeTextGenerationSessionPayloadError extends Schema.TaggedErro
 
 const openCodePromptErrorContext = {
   ...openCodeTextGenerationErrorContext,
-  sessionId: Schema.String,
+  sessionId: Schema.optional(Schema.String),
   providerId: Schema.String,
   modelId: Schema.String,
 };
@@ -106,7 +106,22 @@ export class OpenCodeTextGenerationEmptyOutputError extends Schema.TaggedError<O
   },
 ) {
   override get message(): string {
-    return `OpenCode returned empty output for ${this.operation} in ${this.cwd} using ${this.providerId}/${this.modelId} (session ${this.sessionId}, ${this.responsePartCount} response parts, ${this.textPartCount} text parts).`;
+    const source = this.sessionId ? `session ${this.sessionId}, ` : "generate.text, ";
+    return `OpenCode returned empty output for ${this.operation} in ${this.cwd} using ${this.providerId}/${this.modelId} (${source}${this.responsePartCount} response parts, ${this.textPartCount} text parts).`;
+  }
+}
+
+export class OpenCodeTextGenerationGenerateRequestError extends Schema.TaggedError<OpenCodeTextGenerationGenerateRequestError>()(
+  "OpenCodeTextGenerationGenerateRequestError",
+  {
+    ...openCodeTextGenerationErrorContext,
+    providerId: Schema.String,
+    modelId: Schema.String,
+    cause: Schema.Defect(),
+  },
+) {
+  override get message(): string {
+    return `OpenCode generate.text request failed for ${this.operation} in ${this.cwd} using ${this.providerId}/${this.modelId}.`;
   }
 }
 
@@ -193,19 +208,76 @@ export const makeOpenCodeTextGeneration = Effect.fn("makeOpenCodeTextGeneration"
       });
     }
 
-    const fileParts = OpenCodeRuntime.toOpenCodeFileParts({
-      attachments: input.attachments?.filter((attachment) => attachment.type === "image"),
-      resolveAttachmentPath: (attachment) =>
-        resolveAttachmentPath({ attachmentsDir: serverConfig.attachmentsDir, attachment }),
-    });
-
     const runAgainstServer = Effect.fn("runOpenCodeJson.runAgainstServer")(
       function* (
         server: Pick<
           OpenCodeRuntime.OpenCodeServerConnection,
-          "url" | "serverPassword" | "version"
+          "url" | "serverPassword" | "version" | "apiVersion"
         >,
       ) {
+        const selectedAgent = getModelSelectionStringOptionValue(input.modelSelection, "agent");
+        const selectedVariant = getModelSelectionStringOptionValue(input.modelSelection, "variant");
+        if (server.apiVersion === 2) {
+          if (input.attachments?.some((attachment) => attachment.type === "image")) {
+            return yield* new TextGenerationError({
+              operation: input.operation,
+              detail: "OpenCode 2 generate.text does not support image attachments.",
+            });
+          }
+          if (selectedAgent) {
+            return yield* new TextGenerationError({
+              operation: input.operation,
+              detail: "OpenCode 2 generate.text does not support selecting an agent.",
+            });
+          }
+          if (!openCodeRuntime.createOpenCodeV2Client) {
+            return yield* new TextGenerationError({
+              operation: input.operation,
+              detail: "OpenCode 2 text generation support is unavailable.",
+            });
+          }
+
+          const promptContext = {
+            operation: input.operation,
+            cwd: input.cwd,
+            providerId: parsedModel.providerID,
+            modelId: parsedModel.modelID,
+          };
+          const client = openCodeRuntime.createOpenCodeV2Client({
+            baseUrl: server.url,
+            ...(server.serverPassword !== undefined
+              ? { serverPassword: server.serverPassword }
+              : {}),
+          });
+          const result = yield* Effect.tryPromise({
+            try: () =>
+              client.generate.text({
+                prompt: input.prompt,
+                model: {
+                  providerID: parsedModel.providerID,
+                  id: parsedModel.modelID,
+                  ...(selectedVariant ? { variant: selectedVariant } : {}),
+                },
+              }),
+            catch: (cause) =>
+              new OpenCodeTextGenerationGenerateRequestError({ ...promptContext, cause }),
+          });
+          const rawText = result.text.trim();
+          if (rawText.length === 0) {
+            return yield* new OpenCodeTextGenerationEmptyOutputError({
+              ...promptContext,
+              responsePartCount: 1,
+              textPartCount: 1,
+            });
+          }
+          return rawText;
+        }
+
+        const fileParts = OpenCodeRuntime.toOpenCodeFileParts({
+          attachments: input.attachments?.filter((attachment) => attachment.type === "image"),
+          resolveAttachmentPath: (attachment) =>
+            resolveAttachmentPath({ attachmentsDir: serverConfig.attachmentsDir, attachment }),
+        });
         const client = openCodeRuntime.createOpenCodeSdkClient({
           baseUrl: server.url,
           directory: input.cwd,
@@ -230,8 +302,6 @@ export const makeOpenCodeTextGeneration = Effect.fn("makeOpenCodeTextGeneration"
             cwd: input.cwd,
           });
         }
-        const selectedAgent = getModelSelectionStringOptionValue(input.modelSelection, "agent");
-        const selectedVariant = getModelSelectionStringOptionValue(input.modelSelection, "variant");
         const promptContext = {
           operation: input.operation,
           cwd: input.cwd,
@@ -296,6 +366,16 @@ export const makeOpenCodeTextGeneration = Effect.fn("makeOpenCodeTextGeneration"
             new TextGenerationError({
               operation: cause.operation,
               detail: "OpenCode session.prompt request failed.",
+              cause,
+            }),
+          ),
+        OpenCodeTextGenerationGenerateRequestError: (cause) =>
+          Effect.fail(
+            new TextGenerationError({
+              operation: cause.operation,
+              detail: `OpenCode generate.text request failed: ${OpenCodeRuntime.openCodeRuntimeErrorDetail(
+                cause.cause,
+              )} The OpenCode 2 endpoint uses the server's global provider configuration, not project-specific configuration from ${cause.cwd}.`,
               cause,
             }),
           ),

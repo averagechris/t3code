@@ -74,6 +74,18 @@ describe("buildOpenCodePermissionRules", () => {
       { permission: "external_directory", pattern: "*", action: "allow" },
     ]);
   });
+
+  it("denies child agents in restricted OpenCode 2 sessions", () => {
+    for (const runtimeMode of ["approval-required", "auto-accept-edits", "auto"] as const) {
+      NodeAssert.equal(actionFor(runtimeMode, "subagent"), "ask");
+      NodeAssert.equal(
+        buildOpenCodePermissionRules(runtimeMode, 2).findLast(
+          (rule) => rule.permission === "subagent",
+        )?.action,
+        "deny",
+      );
+    }
+  });
 });
 
 describe("toOpenCodePermissionReply", () => {
@@ -85,5 +97,10 @@ describe("toOpenCodePermissionReply", () => {
     ["cancel", "reject"],
   ] as const)("maps %s to %s", (decision, reply) => {
     NodeAssert.equal(toOpenCodePermissionReply(decision), reply);
+  });
+
+  it("keeps session-only approval narrow on OpenCode 2", () => {
+    NodeAssert.equal(toOpenCodePermissionReply("acceptForSession", 2), "once");
+    NodeAssert.equal(toOpenCodePermissionReply("acceptAlways", 2), "always");
   });
 });

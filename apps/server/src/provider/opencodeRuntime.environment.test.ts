@@ -19,10 +19,131 @@ import {
   OpenCodeRuntime,
   OpenCodeRuntimeError,
   OpenCodeRuntimeLive,
+  openCodeApiVersionForVersion,
+  parseOpenCodeCliVersion,
+  parseServerUrlFromOutput,
+  probeOpenCodeServer,
   resolveOpenCodeConfigContent,
   resolveOpenCodeServerPassword,
   verifyOpenCodeServerVersion,
 } from "./opencodeRuntime.ts";
+
+describe("OpenCode version and ready-line detection", () => {
+  it("detects V1 and V2 CLI versions including build metadata", () => {
+    expect(parseOpenCodeCliVersion("opencode 1.14.19")).toBe("1.14.19");
+    expect(parseOpenCodeCliVersion("opencode2 v2.0.8+desktop.3")).toBe("2.0.8+desktop.3");
+    expect(openCodeApiVersionForVersion("1.14.19")).toBe(1);
+    expect(openCodeApiVersionForVersion("2.0.8+desktop.3")).toBe(2);
+  });
+
+  it("parses both server ready-line formats", () => {
+    expect(parseServerUrlFromOutput("opencode server listening on http://127.0.0.1:1\n")).toBe(
+      "http://127.0.0.1:1",
+    );
+    expect(parseServerUrlFromOutput("server listening on http://127.0.0.1:2\n")).toBe(
+      "http://127.0.0.1:2",
+    );
+  });
+});
+
+describe("probeOpenCodeServer", () => {
+  effectIt.effect("uses authenticated /api/info and enforces the OpenCode 2 minimum", () =>
+    Effect.gen(function* () {
+      let authorization: string | null = null;
+      const result = yield* probeOpenCodeServer({
+        baseUrl: "https://opencode.test",
+        directory: "/workspace",
+        serverPassword: "secret",
+        v1Client: makeHealthClient(() => Promise.reject(new Error("v1 fallback must not run"))),
+        fetch: Object.assign(
+          async (_url: Parameters<typeof globalThis.fetch>[0], init?: RequestInit) => {
+            authorization = new Headers(init?.headers).get("authorization");
+            return Response.json({
+              version: "2.0.8+desktop.1",
+              pid: 1,
+              urls: [],
+              paths: { tmp: "/tmp" },
+            });
+          },
+          { preconnect: () => undefined },
+        ),
+      });
+      expect(result).toEqual({ version: "2.0.8+desktop.1", apiVersion: 2 });
+      expect(authorization).toBe(`Basic ${Buffer.from("opencode:secret").toString("base64")}`);
+    }),
+  );
+
+  effectIt.effect("reports a missing OpenCode 2 password precisely", () =>
+    probeOpenCodeServer({
+      baseUrl: "https://opencode.test",
+      directory: "/workspace",
+      v1Client: makeHealthClient(() => Promise.reject(new Error("v1 fallback must not run"))),
+      fetch: Object.assign(async () => new Response(null, { status: 401 }), {
+        preconnect: () => undefined,
+      }),
+    }).pipe(
+      Effect.flip,
+      Effect.tap((error) =>
+        Effect.sync(() => expect(error.detail).toContain("requires authentication (HTTP 401)")),
+      ),
+    ),
+  );
+
+  effectIt.effect("rejects an OpenCode 2 server below the minimum version", () =>
+    probeOpenCodeServer({
+      baseUrl: "https://opencode.test",
+      directory: "/workspace",
+      v1Client: makeHealthClient(() => Promise.reject(new Error("v1 fallback must not run"))),
+      fetch: Object.assign(
+        async () =>
+          Response.json({ version: "2.0.7", pid: 1, urls: [], paths: { tmp: "/tmp" } }),
+        { preconnect: () => undefined },
+      ),
+    }).pipe(
+      Effect.flip,
+      Effect.tap((error) =>
+        Effect.sync(() => expect(error.detail).toContain("OpenCode v2.0.7 is too old")),
+      ),
+    ),
+  );
+
+  effectIt.effect("does not mistake a starting OpenCode 2 server for OpenCode 1", () =>
+    Effect.gen(function* () {
+      let v1FallbackCalled = false;
+      const error = yield* probeOpenCodeServer({
+        baseUrl: "https://opencode.test",
+        directory: "/workspace",
+        v1Client: makeHealthClient(() => {
+          v1FallbackCalled = true;
+          return Promise.resolve({ data: { healthy: true, version: "1.14.19" } });
+        }),
+        fetch: Object.assign(async () => new Response(null, { status: 503 }), {
+          preconnect: () => undefined,
+        }),
+      }).pipe(Effect.flip);
+
+      expect(error.detail).toContain("not ready (HTTP 503)");
+      expect(v1FallbackCalled).toBe(false);
+    }),
+  );
+
+  effectIt.effect("falls back to OpenCode 1 only when /api/info is missing", () =>
+    Effect.gen(function* () {
+      const result = yield* probeOpenCodeServer({
+        baseUrl: "https://opencode.test",
+        directory: "/workspace",
+        v1Client: makeHealthClient(() =>
+          Promise.resolve({ data: { healthy: true, version: "1.14.19" } }),
+        ),
+        fetch: Object.assign(async () => new Response(null, { status: 404 }), {
+          preconnect: () => undefined,
+        }),
+      });
+
+      expect(result).toEqual({ version: "1.14.19", apiVersion: 1 });
+    }),
+  );
+});
 
 describe("resolveOpenCodeConfigContent", () => {
   it("prefers the caller environment over the inherited environment", () => {
@@ -185,6 +306,11 @@ const writeOutput = (stream) => new Promise((resolve, reject) => {
   stream.write("x".repeat(2 * 1024 * 1024), (error) => error ? reject(error) : resolve());
 });
 const server = createServer(async (request, response) => {
+  if (request.url.startsWith("/api/info")) {
+    response.statusCode = 404;
+    response.end();
+    return;
+  }
   if (request.url.startsWith("/global/health")) {
     response.setHeader("Content-Type", "application/json");
     response.end(JSON.stringify({ healthy: true, version: "1.14.19" }));
@@ -193,6 +319,10 @@ const server = createServer(async (request, response) => {
   await Promise.all([writeOutput(process.stdout), writeOutput(process.stderr)]);
   response.end("drained");
 });
+if (process.argv.includes("--version")) {
+  process.stdout.write("opencode 1.14.19\\n");
+  process.exit(0);
+}
 server.listen(0, "127.0.0.1", () => {
   process.stdout.write("opencode server listening on http://127.0.0.1:" + server.address().port + "\\n");
 });
